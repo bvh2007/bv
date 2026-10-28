@@ -1,0 +1,42 @@
+const path=require('path');
+const express=require('express'), helmet=require('helmet'),rateLimit=require('express-rate-limit');
+const session=require('express-session'), MySQLStore=require('express-mysql-session')(session);
+const bcrypt=require('bcryptjs'),multer=require('multer'),cloudinary=require('cloudinary').v2;
+const db=require('./db');
+const app=express();if(process.env.TRUST_PROXY==='1')app.set('trust proxy',1);
+app.disable('x-powered-by');
+app.use(helmet({contentSecurityPolicy:false})); // External module bundle and inline CSS only; configure stricter CSP for your deployment.
+app.use(express.json({limit:'32kb'}));
+app.use(express.static(path.join(__dirname,'../frontend'),{index:false}));
+app.use(session({name:'sb.sid',secret:process.env.SESSION_SECRET||'DEV_ONLY_CHANGE_ME',resave:false,saveUninitialized:false,store:new MySQLStore({clearExpired:true,checkExpirationInterval:900000,expiration:604800000},db),cookie:{httpOnly:true,sameSite:'lax',secure:process.env.NODE_ENV==='production',maxAge:7*24*3600*1000}}));
+const limiter=rateLimit({windowMs:15*60*1000,limit:50,standardHeaders:'draft-7',legacyHeaders:false});
+const strict=rateLimit({windowMs:15*60*1000,limit:5,standardHeaders:'draft-7',legacyHeaders:false});
+app.use('/api',limiter);
+const empty={recipientName:'',welcomeTitle:'',letterTitle:'',letterParagraphs:['','',''],reflections:[{title:'',body:''},{title:'',body:''},{title:'',body:''}],closingMessage:'',clickMessages:[]};
+const cleanText=(x,max)=>typeof x==='string'?x.trim().slice(0,max):'';
+const cleanContent=(v)=>({recipientName:cleanText(v?.recipientName,70),welcomeTitle:cleanText(v?.welcomeTitle,150),letterTitle:cleanText(v?.letterTitle,150),letterParagraphs:Array.from({length:3},(_,i)=>cleanText(v?.letterParagraphs?.[i],1600)),reflections:Array.from({length:3},(_,i)=>({title:cleanText(v?.reflections?.[i]?.title,100),body:cleanText(v?.reflections?.[i]?.body,900)})),closingMessage:cleanText(v?.closingMessage,600),clickMessages:(Array.isArray(v?.clickMessages)?v.clickMessages:[]).slice(0,40).map(x=>cleanText(x,100)).filter(Boolean)});
+const requireAdmin=(req,res,next)=>req.session.adminId?next():res.status(401).json({error:'Login required'});
+// State-changing API calls require same-origin Origin (browser CSRF defense), plus SameSite cookies.
+const sameOrigin=(req,res,next)=>{if(['GET','HEAD','OPTIONS'].includes(req.method))return next();const origin=req.get('origin');const host=req.get('x-forwarded-host')||req.get('host');if(!origin||!host)return res.status(403).json({error:'Origin required'});try{if(new URL(origin).host!==host)return res.status(403).json({error:'Origin mismatch'});}catch{return res.status(403).json({error:'Invalid origin'})}next()};
+app.use('/api',sameOrigin);
+cloudinary.config({cloud_name:process.env.CLOUDINARY_CLOUD_NAME,api_key:process.env.CLOUDINARY_API_KEY,api_secret:process.env.CLOUDINARY_API_SECRET,secure:true});
+app.get('/api/health',async(req,res,next)=>{try{await db.query('SELECT 1');res.json({status:'ok'})}catch(e){next(e)}});
+app.get('/api/message',async(req,res,next)=>{try{const [rows]=await db.query('SELECT json_data FROM content WHERE id=1');res.json(rows.length?cleanContent(rows[0].json_data):empty)}catch(e){next(e)}});
+app.get('/api/photos',async(req,res,next)=>{try{const [rows]=await db.query('SELECT id,title,message,sort_order,public_id IS NOT NULL AS has_image FROM photos ORDER BY sort_order,id');res.json(rows.map(({id,title,message,sort_order,has_image})=>({id,title,message,sort_order,hasImage:!!has_image,imageUrl:has_image?`/api/photos/${id}/image`:null})))}catch(e){next(e)}});
+// These images are viewable by anyone who knows the site URL. Do not upload sensitive/private photos.
+app.get('/api/photos/:id/image',async(req,res,next)=>{try{const id=Number(req.params.id);if(!Number.isInteger(id)||id<1||id>5)return res.sendStatus(404);const [rows]=await db.execute('SELECT public_id FROM photos WHERE id=?',[id]);if(!rows[0]?.public_id)return res.sendStatus(404);const url=cloudinary.url(rows[0].public_id,{type:'authenticated',sign_url:true,secure:true,resource_type:'image',transformation:[{width:1200,height:1200,crop:'limit',quality:'auto',fetch_format:'jpg'}]});const r=await fetch(url);if(!r.ok)return res.sendStatus(502);res.set('Cache-Control','private, max-age=120');res.type('image/jpeg');const buffer=Buffer.from(await r.arrayBuffer());if(buffer.length>8*1024*1024)return res.sendStatus(502);res.send(buffer)}catch(e){next(e)}});
+app.post('/api/replies',strict,async(req,res,next)=>{try{const msg=cleanText(req.body?.message,1001);if(msg.length<1||msg.length>1000)return res.status(400).json({error:'Message must be 1–1000 characters'});await db.execute('INSERT INTO replies(message) VALUES(?)',[msg]);res.status(201).json({ok:true})}catch(e){next(e)}});
+app.post('/api/admin/login',strict,async(req,res,next)=>{try{const email=cleanText(req.body?.email,190).toLowerCase();const password=req.body?.password;if(typeof password!=='string')return res.sendStatus(400);const [rows]=await db.execute('SELECT id,password_hash FROM admins WHERE email=?',[email]);const hash=rows[0]?.password_hash||'$2a$12$3XwMQEymB6F7hUzxLaXUbeSz8UD1TEhwG8ymlrEm/PUJzHYtCPhb2';const ok=await bcrypt.compare(password,hash);if(!rows[0]||!ok)return res.status(401).json({error:'Invalid credentials'});req.session.regenerate(e=>{if(e)return next(e);req.session.adminId=rows[0].id;res.json({ok:true})})}catch(e){next(e)}});
+app.get('/api/admin/me',(req,res)=>res.json({authenticated:!!req.session.adminId}));
+app.post('/api/admin/logout',requireAdmin,(req,res,next)=>req.session.destroy(e=>e?next(e):res.json({ok:true})));
+app.put('/api/admin/content',requireAdmin,async(req,res,next)=>{try{const content=cleanContent(req.body);await db.execute('INSERT INTO content(id,json_data) VALUES(1,?) ON DUPLICATE KEY UPDATE json_data=VALUES(json_data)',[JSON.stringify(content)]);res.json({ok:true})}catch(e){next(e)}});
+app.get('/api/admin/replies',requireAdmin,async(req,res,next)=>{try{const [rows]=await db.query('SELECT id,message,created_at FROM replies ORDER BY id DESC LIMIT 100');res.json(rows)}catch(e){next(e)}});
+app.put('/api/admin/photos/:id',requireAdmin,async(req,res,next)=>{try{const id=Number(req.params.id),order=Number(req.body?.sort_order);if(!Number.isInteger(id)||id<1||id>5||!Number.isInteger(order)||order<1||order>5)return res.sendStatus(400);await db.execute('UPDATE photos SET title=?,message=?,sort_order=? WHERE id=?',[cleanText(req.body.title,120),cleanText(req.body.message,1500),order,id]);res.json({ok:true})}catch(e){next(e)}});
+const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:5*1024*1024},fileFilter:(req,file,cb)=>cb(null,['image/jpeg','image/png','image/webp'].includes(file.mimetype))});
+app.post('/api/admin/photos/:id/upload',requireAdmin,upload.single('photo'),async(req,res,next)=>{try{const id=Number(req.params.id);if(!Number.isInteger(id)||id<1||id>5||!req.file)return res.status(400).json({error:'JPEG/PNG/WebP image up to 5 MB required'});const sig=req.file.buffer.subarray(0,12);const jpeg=sig[0]===0xff&&sig[1]===0xd8&&sig[2]===0xff;const png=sig.subarray(0,8).equals(Buffer.from('89504e470d0a1a0a','hex'));const webp=sig.toString('ascii',0,4)==='RIFF'&&sig.toString('ascii',8,12)==='WEBP';if(!jpeg&&!png&&!webp)return res.status(400).json({error:'Invalid image bytes'});
+const [old]=await db.execute('SELECT public_id FROM photos WHERE id=?',[id]);const dataUri=`data:${jpeg?'image/jpeg':png?'image/png':'image/webp'};base64,${req.file.buffer.toString('base64')}`;const uploaded=await cloudinary.uploader.upload(dataUri,{folder:'sorry-bloom-private',type:'authenticated',resource_type:'image',overwrite:false});await db.execute('UPDATE photos SET public_id=? WHERE id=?',[uploaded.public_id,id]);if(old[0]?.public_id)cloudinary.uploader.destroy(old[0].public_id,{type:'authenticated'}).catch(()=>{});res.json({ok:true})}catch(e){next(e)}});
+app.get('/admin',(req,res)=>res.sendFile(path.join(__dirname,'../frontend/admin.html')));
+app.get('/gift',(req,res)=>res.sendFile(path.join(__dirname,'../frontend/gift.html')));
+app.get('/',(req,res)=>res.sendFile(path.join(__dirname,'../frontend/index.html')));
+app.use((err,req,res,next)=>{console.error(err);if(err.code==='LIMIT_FILE_SIZE')return res.status(413).json({error:'File exceeds 5 MB'});res.status(500).json({error:'Server error'})});
+module.exports=app;
